@@ -80,11 +80,10 @@ func Run() {
 	m3u8Url := *urlFlag
 	maxGoroutines := *nFlag
 	hostType := *htFlag
-	movieDir := *oFlag
+	downloadFileName := *oFlag
 	cookie := *cFlag
 	insecure := *sFlag
 	savePath := *spFlag
-
 	ro.Headers["Referer"] = getHost(m3u8Url, "apiv2")
 	if insecure != 0 {
 		ro.InsecureSkipVerify = true
@@ -99,44 +98,52 @@ func Run() {
 		flag.Usage()
 		return
 	}
-
-	var download_dir string
 	pwd, _ := os.Getwd()
 	if savePath != "" {
 		pwd = savePath
 	}
 	//pwd = "/Users/chao/Desktop" //自定义地址
-	download_dir = pwd + "/movie/" + movieDir
-	if isExist, _ := PathExists(download_dir); !isExist {
-		os.MkdirAll(download_dir, os.ModePerm)
+	downloadTmpDir := path.Join(pwd, downloadFileName+"_tmp")
+	if isExist, _ := PathExists(downloadTmpDir); !isExist {
+		err := os.MkdirAll(downloadTmpDir, os.ModePerm)
+		if err != nil {
+			panic(fmt.Errorf("创建目录[%v]出现异常:%v", downloadTmpDir, err))
+		}
 	}
 
 	m3u8Host := getHost(m3u8Url, hostType)
 	m3u8Body := getM3u8Body(m3u8Url)
 	//m3u8Body := getFromFile()
 
-	ts_key := getM3u8Key(m3u8Host, m3u8Body)
-	if ts_key != "" {
-		fmt.Printf("待解密 ts 文件 key : %s \n", ts_key)
+	tsKey := getM3u8Key(m3u8Host, m3u8Body)
+	if tsKey != "" {
+		fmt.Printf("待解密 ts 文件 key : %s \n", tsKey)
 	}
 
-	ts_list := getTsList(m3u8Host, m3u8Body)
-	fmt.Println("待下载 ts 文件数量:", len(ts_list))
+	tsList := getTsList(m3u8Host, m3u8Body)
+	fmt.Println("待下载 ts 文件数量:", len(tsList))
 
 	// 下载ts
-	downloader(ts_list, maxGoroutines, download_dir, ts_key)
+	downloader(tsList, maxGoroutines, downloadTmpDir, tsKey)
 
 	switch runtime.GOOS {
 	case "windows":
-		win_merge_file(download_dir)
+		winMergeFile(downloadTmpDir)
 	default:
-		unix_merge_file(download_dir)
+		unixMergeFile(downloadTmpDir)
 	}
-	os.Rename(download_dir+"/merge.mp4", download_dir+".mp4")
-	os.RemoveAll(download_dir)
-
+	finalSavePath := path.Join(pwd, downloadFileName+".mp4")
+	err := os.Rename(path.Join(downloadTmpDir, "merge.mp4"), finalSavePath)
+	if err != nil {
+		panic(fmt.Errorf("重命名合并文件时出现异常:%v", err))
+	}
+	Chdir(pwd)
+	err = os.RemoveAll(downloadTmpDir)
+	if err != nil {
+		panic(fmt.Errorf("删除临时目录[%v]时出现错误:%v", downloadTmpDir, err))
+	}
 	DrawProgressBar("Merging", float32(1), PROGRESS_WIDTH, "merge.ts")
-	fmt.Printf("\n[Success] 下载保存路径：%s | 共耗时: %6.2fs\n", download_dir+".mp4", time.Now().Sub(now).Seconds())
+	fmt.Printf("\n[Success] 下载保存路径：%s | 共耗时: %6.2fs\n", finalSavePath, time.Now().Sub(now).Seconds())
 }
 
 // 获取m3u8地址的host
@@ -165,13 +172,13 @@ func getM3u8Key(host, html string) (key string) {
 	key = ""
 	for _, line := range lines {
 		if strings.Contains(line, "#EXT-X-KEY") {
-			uri_pos := strings.Index(line, "URI")
-			quotation_mark_pos := strings.LastIndex(line, "\"")
-			key_url := strings.Split(line[uri_pos:quotation_mark_pos], "\"")[1]
+			uriPos := strings.Index(line, "URI")
+			quotationMarkPos := strings.LastIndex(line, "\"")
+			keyUrl := strings.Split(line[uriPos:quotationMarkPos], "\"")[1]
 			if !strings.Contains(line, "http") {
-				key_url = fmt.Sprintf("%s/%s", host, key_url)
+				keyUrl = fmt.Sprintf("%s/%s", host, keyUrl)
 			}
-			res, err := grequests.Get(key_url, ro)
+			res, err := grequests.Get(keyUrl, ro)
 			checkErr(err)
 			if res.StatusCode == 200 {
 				key = res.String()
@@ -208,7 +215,7 @@ func getTsList(host, body string) (tsList []TsInfo) {
 	return
 }
 
-// 判断文件是否存在
+// PathExists 判断文件是否存在
 func PathExists(path string) (bool, error) {
 	_, err := os.Stat(path)
 	if err == nil {
@@ -227,23 +234,23 @@ func getFromFile() string {
 
 // 下载ts文件
 // @modify: 2020-08-13 修复ts格式SyncByte合并不能播放问题
-func downloadTsFile(ts TsInfo, download_dir, key string, retries int) {
+func downloadTsFile(ts TsInfo, downloadDir, key string, retries int) {
 	defer func() {
 		if r := recover(); r != nil {
 			//fmt.Println("网络不稳定，正在进行断点持续下载")
-			downloadTsFile(ts, download_dir, key, retries-1)
+			downloadTsFile(ts, downloadDir, key, retries-1)
 		}
 	}()
 
-	curr_path := fmt.Sprintf("%s/%s", download_dir, ts.Name)
-	if isExist, _ := PathExists(curr_path); isExist {
+	currPath := fmt.Sprintf("%s/%s", downloadDir, ts.Name)
+	if isExist, _ := PathExists(currPath); isExist {
 		//logger.Println("[warn] File: " + ts.Name + "already exist")
 		return
 	}
 	res, err := grequests.Get(ts.Url, ro)
 	if err != nil || !res.Ok {
 		if retries > 0 {
-			downloadTsFile(ts, download_dir, key, retries-1)
+			downloadTsFile(ts, downloadDir, key, retries-1)
 			return
 		} else {
 			//logger.Printf("[warn] File :%s, Retry %d \n", ts.Url, retries-1)
@@ -261,7 +268,7 @@ func downloadTsFile(ts TsInfo, download_dir, key string, retries int) {
 	}
 	if len(origData) == 0 || (contentLen > 0 && len(origData) < contentLen) || res.Error != nil {
 		//logger.Println("[warn] File: " + ts.Name + "res origData invalid or err：", res.Error)
-		downloadTsFile(ts, download_dir, key, retries-1)
+		downloadTsFile(ts, downloadDir, key, retries-1)
 		return
 	}
 
@@ -270,7 +277,7 @@ func downloadTsFile(ts TsInfo, download_dir, key string, retries int) {
 		//解密 ts 文件，算法：aes 128 cbc pack5
 		origData, err = AesDecrypt(origData, []byte(key))
 		if err != nil {
-			downloadTsFile(ts, download_dir, key, retries-1)
+			downloadTsFile(ts, downloadDir, key, retries-1)
 			return
 		}
 	}
@@ -285,7 +292,10 @@ func downloadTsFile(ts TsInfo, download_dir, key string, retries int) {
 			break
 		}
 	}
-	ioutil.WriteFile(curr_path, origData, 0666)
+	err = ioutil.WriteFile(currPath, origData, 0666)
+	if err != nil {
+		panic(fmt.Errorf("向[%v]写入解密后数据时出现异常:%v", currPath, err))
+	}
 }
 
 // downloader m3u8 下载器
@@ -313,7 +323,7 @@ func downloader(tsList []TsInfo, maxGoroutines int, downloadDir string, key stri
 	wg.Wait()
 }
 
-// 进度条
+// DrawProgressBar 进度条
 func DrawProgressBar(prefix string, proportion float32, width int, suffix ...string) {
 	pos := int(proportion * float32(width))
 	s := fmt.Sprintf("[%s] %s%*s %6.2f%% \t%s",
@@ -323,60 +333,73 @@ func DrawProgressBar(prefix string, proportion float32, width int, suffix ...str
 
 // ============================== shell相关 ==============================
 
-// 执行 shell
+// ExecUnixShell 执行 shell
 func ExecUnixShell(s string) {
 	cmd := exec.Command("/bin/bash", "-c", s)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	err := cmd.Run()
 	if err != nil {
-		panic(err)
+		panic(fmt.Errorf("执行UnixShell命令[%v]时出现异常:%v", s, err))
 	}
 	fmt.Printf("%s", out.String())
 }
 
-func ExecWinShell(s string) error {
+func ExecWinShell(s string) {
 	cmd := exec.Command("cmd", "/C", s)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	err := cmd.Run()
 	if err != nil {
-		return err
+		panic(fmt.Errorf("执行WinShell命令[%v]时出现异常:%v", s, err))
 	}
 	fmt.Printf("%s", out.String())
-	return nil
 }
 
 // windows 合并文件
-func win_merge_file(path string) {
-	os.Chdir(path)
+func winMergeFile(path string) {
+	Chdir(path)
 	ExecWinShell("copy /b *.ts merge.tmp")
 	ExecWinShell("del /Q *.ts")
-	os.Rename("merge.tmp", "merge.mp4")
+	Rename("merge.tmp", "merge.mp4")
+}
+
+func Chdir(path string) {
+	err := os.Chdir(path)
+	if err != nil {
+		panic(fmt.Errorf("更改工作目录为指定目录[%v]时出现异常:%v", path, err))
+	}
+}
+
+func Rename(oldPath, newPath string) {
+	err := os.Rename(oldPath, newPath)
+	if err != nil {
+		panic(fmt.Errorf("重命名文件[%v] -> [%v]时出现异常:%v", oldPath, newPath, err))
+	}
 }
 
 // unix 合并文件
-func unix_merge_file(path string) {
-	os.Chdir(path)
+func unixMergeFile(path string) {
+	Chdir(path)
 	//cmd := `ls  *.ts |sort -t "\." -k 1 -n |awk '{print $0}' |xargs -n 1 -I {} bash -c "cat {} >> new.tmp"`
 	cmd := `cat *.ts >> merge.tmp`
 	ExecUnixShell(cmd)
 	ExecUnixShell("rm -rf *.ts")
-	os.Rename("merge.tmp", "merge.mp4")
+	Rename("merge.tmp", "merge.mp4")
 }
 
 // ============================== 加解密相关 ==============================
 
 func PKCS7Padding(ciphertext []byte, blockSize int) []byte {
 	padding := blockSize - len(ciphertext)%blockSize
-	padtext := bytes.Repeat([]byte{byte(padding)}, padding)
-	return append(ciphertext, padtext...)
+	padText := bytes.Repeat([]byte{byte(padding)}, padding)
+	return append(ciphertext, padText...)
 }
 
 func PKCS7UnPadding(origData []byte) []byte {
 	length := len(origData)
-	unpadding := int(origData[length-1])
-	return origData[:(length - unpadding)]
+	unPadding := int(origData[length-1])
+	return origData[:(length - unPadding)]
 }
 
 func AesEncrypt(origData, key []byte, ivs ...[]byte) ([]byte, error) {
@@ -393,12 +416,12 @@ func AesEncrypt(origData, key []byte, ivs ...[]byte) ([]byte, error) {
 	}
 	origData = PKCS7Padding(origData, blockSize)
 	blockMode := cipher.NewCBCEncrypter(block, iv[:blockSize])
-	crypted := make([]byte, len(origData))
-	blockMode.CryptBlocks(crypted, origData)
-	return crypted, nil
+	encrypted := make([]byte, len(origData))
+	blockMode.CryptBlocks(encrypted, origData)
+	return encrypted, nil
 }
 
-func AesDecrypt(crypted, key []byte, ivs ...[]byte) ([]byte, error) {
+func AesDecrypt(encrypted, key []byte, ivs ...[]byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -411,8 +434,8 @@ func AesDecrypt(crypted, key []byte, ivs ...[]byte) ([]byte, error) {
 		iv = ivs[0]
 	}
 	blockMode := cipher.NewCBCDecrypter(block, iv[:blockSize])
-	origData := make([]byte, len(crypted))
-	blockMode.CryptBlocks(origData, crypted)
+	origData := make([]byte, len(encrypted))
+	blockMode.CryptBlocks(origData, encrypted)
 	origData = PKCS7UnPadding(origData)
 	return origData, nil
 }
