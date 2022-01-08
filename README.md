@@ -34,10 +34,11 @@ golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指�
 
 ## 下载
 
-已经编译好的平台有： [点击下载](https://github.com/llychao/m3u8-downloader/releases)
+已经编译好的平台有： [点击下载](https://github.com/Manx98/m3u8-downloader/releases)
 
 - windows/amd64
 - linux/amd64
+- linux/aarch64
 - darwin/amd64
 
 ## 用法
