@@ -5,11 +5,15 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"flag"
 	"fmt"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/url"
@@ -34,16 +38,18 @@ const (
 
 var (
 	// 命令行参数
-	urlFlag = flag.String("u", "", "m3u8下载地址(http(s)://url/xx/xx/index.m3u8)")
-	nFlag   = flag.Int("n", 16, "下载线程数(max goroutines num)")
-	htFlag  = flag.String("ht", "apiv1", "设置getHost的方式(apiv1: `http(s):// + url.Host + path.Dir(url.Path)`; apiv2: `http(s)://+ u.Host`")
-	oFlag   = flag.String("o", "output", "自定义文件名(默认为output)")
-	cFlag   = flag.String("c", "", "自定义请求cookie")
-	sFlag   = flag.Int("s", 0, "是否允许不安全的请求(默认为0)")
-	spFlag  = flag.String("sp", "", "文件保存路径(默认为当前路径)")
-
-	logger *log.Logger
-	ro     = &grequests.RequestOptions{
+	urlFlag            = flag.String("u", "", "m3u8下载地址(http(s)://url/xx/xx/index.m3u8)")
+	nFlag              = flag.Int("n", 16, "下载线程数(max goroutines num)")
+	htFlag             = flag.String("ht", "apiv1", "设置getHost的方式(apiv1: `http(s):// + url.Host + path.Dir(url.Path)`; apiv2: `http(s)://+ u.Host`")
+	oFlag              = flag.String("o", "output", "自定义文件名(默认为output)")
+	cFlag              = flag.String("c", "", "自定义请求cookie")
+	sFlag              = flag.Int("s", 0, "是否允许不安全的请求(默认为0)")
+	spFlag             = flag.String("sp", "", "文件保存路径(默认为当前路径)")
+	ffmpegPath         = flag.String("ffmpeg", "", "ffmpeg命令路径(默认不使用ffmpeg来进行ts文件合并)")
+	ffmpegMergeCmdArgs = "-f concat -safe 0 -i ffmpeg_ts_file_list.txt -y -c copy merge.mp4"
+	enableFFmpeg       = false
+	logger             *log.Logger
+	ro                 = &grequests.RequestOptions{
 		UserAgent:      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
 		RequestTimeout: HEAD_TIMEOUT,
 		Headers: map[string]string{
@@ -88,7 +94,6 @@ func Run() {
 	if insecure != 0 {
 		ro.InsecureSkipVerify = true
 	}
-
 	// http 自定义 cookie
 	if cookie != "" {
 		ro.Headers["Cookie"] = cookie
@@ -101,6 +106,12 @@ func Run() {
 	pwd, _ := os.Getwd()
 	if savePath != "" {
 		pwd = savePath
+	}
+
+	// 判断是否填写ffmpeg参数
+	if *ffmpegPath != "" {
+		FFmpegCheck()
+		enableFFmpeg = true
 	}
 	//pwd = "/Users/chao/Desktop" //自定义地址
 	downloadTmpDir := path.Join(pwd, downloadFileName+"_tmp")
@@ -121,29 +132,60 @@ func Run() {
 	}
 
 	tsList := getTsList(m3u8Host, m3u8Body)
+	if enableFFmpeg {
+		writeFFmpegTsFilePathList(downloadTmpDir, tsList)
+	}
 	fmt.Println("待下载 ts 文件数量:", len(tsList))
 
 	// 下载ts
 	downloader(tsList, maxGoroutines, downloadTmpDir, tsKey)
-
+	fmt.Println("[合并]:正在开始合并ts文件合并到临时文件merge.mp4")
 	switch runtime.GOOS {
 	case "windows":
 		winMergeFile(downloadTmpDir)
 	default:
 		unixMergeFile(downloadTmpDir)
 	}
+	fmt.Println("[重命名]:将临时文件重命名为正确文件名")
 	finalSavePath := path.Join(pwd, downloadFileName+".mp4")
 	err := os.Rename(path.Join(downloadTmpDir, "merge.mp4"), finalSavePath)
 	if err != nil {
 		panic(fmt.Errorf("重命名合并文件时出现异常:%v", err))
 	}
 	Chdir(pwd)
+	fmt.Println("[清理]开始移除临时缓存目录")
 	err = os.RemoveAll(downloadTmpDir)
 	if err != nil {
 		panic(fmt.Errorf("删除临时目录[%v]时出现错误:%v", downloadTmpDir, err))
 	}
-	DrawProgressBar("Merging", float32(1), PROGRESS_WIDTH, "merge.ts")
-	fmt.Printf("\n[Success] 下载保存路径：%s | 共耗时: %6.2fs\n", finalSavePath, time.Now().Sub(now).Seconds())
+	fmt.Printf("[Success] 下载保存路径：%s | 共耗时: %6.2fs\n", finalSavePath, time.Now().Sub(now).Seconds())
+}
+
+// writeFFmpegTsFilePathList 将ts文件列表写入到指定目录下的ffmpeg_ts_file_list.txt文件中
+// 以便ffmpeg根据其信息来合并ts文件
+func writeFFmpegTsFilePathList(downloadTmpDir string, tsList []TsInfo) {
+	ffmpegTsListFile := path.Join(downloadTmpDir, "ffmpeg_ts_file_list.txt")
+	file, e := os.OpenFile(ffmpegTsListFile, os.O_WRONLY|os.O_CREATE, 0777)
+	if e != nil {
+		panic(fmt.Errorf("创建[%v]出现异常:%v", ffmpegTsListFile, e))
+	}
+	defer func(file *os.File) {
+		err := file.Close()
+		if err != nil {
+			panic(fmt.Errorf("关闭[%v]出现异常:%v", ffmpegTsListFile, e))
+		}
+	}(file)
+	writer := bufio.NewWriter(file)
+	for _, tsInfo := range tsList {
+		_, err := writer.WriteString("file '" + path.Join(downloadTmpDir, tsInfo.Name) + "'\n")
+		if err != nil {
+			panic(fmt.Errorf("写入ts文件列表到[%v]时出现异常:%v", ffmpegTsListFile, err))
+		}
+	}
+	err := writer.Flush()
+	if err != nil {
+		panic(fmt.Errorf("写入ts文件列表到[%v]时出现异常:%v", ffmpegTsListFile, err))
+	}
 }
 
 // 获取m3u8地址的host
@@ -305,7 +347,7 @@ func downloader(tsList []TsInfo, maxGoroutines int, downloadDir string, key stri
 	limiter := make(chan struct{}, maxGoroutines) //chan struct 内存占用 0 bool 占用 1
 	tsLen := len(tsList)
 	downloadCount := 0
-
+	//var writer *bufio.Writer
 	for _, ts := range tsList {
 		wg.Add(1)
 		limiter <- struct{}{}
@@ -333,35 +375,111 @@ func DrawProgressBar(prefix string, proportion float32, width int, suffix ...str
 
 // ============================== shell相关 ==============================
 
+// GbkToUtf8 GBK编码转换为UTF8编码
+func GbkToUtf8(s []byte) ([]byte, error) {
+	reader := transform.NewReader(bytes.NewReader(s), simplifiedchinese.GBK.NewDecoder())
+	d, e := ioutil.ReadAll(reader)
+	if e != nil {
+		return nil, e
+	}
+	return d, nil
+}
+
+// 异步打印控制台输出
+func asyncLog(reader io.ReadCloser) {
+	buf := make([]byte, 1024, 1024)
+	for {
+		num, err := reader.Read(buf)
+		if err != nil {
+			if err == io.EOF || strings.Contains(err.Error(), "closed") {
+				err = nil
+			}
+			if err != nil {
+				panic(fmt.Errorf("asyncLog 异常:%v", err))
+			}
+		}
+		if num > 0 {
+			oByte := buf[:num]
+			if runtime.GOOS == "windows" {
+				o, e := GbkToUtf8(oByte)
+				if e != nil {
+					fmt.Printf("编码转换失败:%v\n", e)
+				} else {
+					oByte = o
+				}
+			}
+			fmt.Print(string(oByte))
+		}
+	}
+}
+
+// 执行控制台命令并实时打印
+func execute(cmd *exec.Cmd) {
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+
+	if err := cmd.Start(); err != nil {
+		panic(fmt.Errorf("开始执行命令出现异常:%v", err))
+	}
+
+	go asyncLog(stdout)
+	go asyncLog(stderr)
+
+	if err := cmd.Wait(); err != nil {
+		panic(fmt.Errorf("等待命令执行出现异常:%v", err))
+	}
+}
+
+// FFmpegCheck 用于检查FFmpeg配置是否正确
+func FFmpegCheck() {
+	defer func() {
+		err := recover()
+		if err == nil {
+			fmt.Println("[信息]:ffmpeg配置正确")
+		} else {
+			fmt.Println("[错误]:无法执行通过ffmpeg检查命令,请检查ffmpeg程序路径是否正确")
+			panic(fmt.Errorf("执行ffmpeg 检查命令失败"))
+		}
+	}()
+	fmt.Println("[检查]:开始检查ffmpeg配置是否正确")
+	if runtime.GOOS == "windows" {
+		ExecWinShell(*ffmpegPath + " -version")
+	} else {
+		ExecUnixShell(*ffmpegPath + " -version")
+	}
+}
+
 // ExecUnixShell 执行 shell
 func ExecUnixShell(s string) {
+	defer func() {
+		err := recover()
+		if err != nil {
+			panic(fmt.Errorf("执行UnixShell命令[%v]时出现异常", s))
+		}
+	}()
 	cmd := exec.Command("/bin/bash", "-c", s)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	err := cmd.Run()
-	if err != nil {
-		panic(fmt.Errorf("执行UnixShell命令[%v]时出现异常:%v", s, err))
-	}
-	fmt.Printf("%s", out.String())
+	execute(cmd)
 }
 
 func ExecWinShell(s string) {
+	defer func() {
+		err := recover()
+		if err != nil {
+			panic(fmt.Errorf("执行WinShell命令[%v]时出现异常", s))
+		}
+	}()
 	cmd := exec.Command("cmd", "/C", s)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	err := cmd.Run()
-	if err != nil {
-		panic(fmt.Errorf("执行WinShell命令[%v]时出现异常:%v", s, err))
-	}
-	fmt.Printf("%s", out.String())
+	execute(cmd)
 }
 
 // windows 合并文件
 func winMergeFile(path string) {
 	Chdir(path)
-	ExecWinShell("copy /b *.ts merge.tmp")
-	ExecWinShell("del /Q *.ts")
-	Rename("merge.tmp", "merge.mp4")
+	if enableFFmpeg {
+		ExecWinShell(*ffmpegPath + " " + ffmpegMergeCmdArgs)
+	} else {
+		ExecWinShell("copy /b *.ts merge.mp4")
+	}
 }
 
 func Chdir(path string) {
@@ -381,11 +499,11 @@ func Rename(oldPath, newPath string) {
 // unix 合并文件
 func unixMergeFile(path string) {
 	Chdir(path)
-	//cmd := `ls  *.ts |sort -t "\." -k 1 -n |awk '{print $0}' |xargs -n 1 -I {} bash -c "cat {} >> new.tmp"`
-	cmd := `cat *.ts >> merge.tmp`
-	ExecUnixShell(cmd)
-	ExecUnixShell("rm -rf *.ts")
-	Rename("merge.tmp", "merge.mp4")
+	if enableFFmpeg {
+		ExecWinShell(*ffmpegPath + " " + ffmpegMergeCmdArgs)
+	} else {
+		ExecUnixShell(`cat *.ts >> merge.mp4`)
+	}
 }
 
 // ============================== 加解密相关 ==============================

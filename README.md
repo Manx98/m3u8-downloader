@@ -2,7 +2,6 @@
 
 golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指定必要的 flag (`u`、`o`、`n`、`ht`) 来运行, 工具就会自动帮你解析 M3U8 文件，并将 TS 片段下载下来合并成一个文件。
 
-
 ## 功能介绍
 
 1. 下载和解析 M3U8
@@ -15,6 +14,7 @@ golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指�
 > 重要的事情说三遍......
 
 ## 效果展示
+
 ![demo](./demo.gif)
 
 ## 参数说明：
@@ -27,6 +27,7 @@ golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指�
 - c 自定义请求cookie, 默认空
 - s 是否允许不安全的请求, 默认 0
 - sp 文件保存路径, 默认为当前路径
+- ffmpeg ffmpeg命令路径,默认不使用ffmpeg来进行ts文件合并
 ```
 
 默认情况只需要传`u`参数,其他参数保持默认即可。 部分链接可能限制请求频率，可根据实际情况调整 `n` 参数的值。
@@ -68,24 +69,27 @@ Linux 和 MacOS 和 Windows PowerShell
 ## 问题说明
 
 1.在Linux或者mac平台，如果显示无运行权限，请用chmod 命令进行添加权限
+
 ```bash
  # Linux amd64平台
  chmod 0755 m3u8-downloader-v1.0.0-linux-amd64
  # Mac darwin amd64平台
  chmod 0755 m3u8-downloader-v1.0.0-darwin-amd64
  ```
+
 2.下载失败的情况,请设置 -ht="apiv1" 或者 -ht="apiv2" （默认为apiv1）
+
 ```golang
 func get_host(Url string, ht string) string {
-    u, err := url.Parse(Url)
-    var host string
-    checkErr(err)
-    switch ht {
-    case "apiv1":
-        host = u.Scheme + "://" + u.Host + path.Dir(u.Path)
-    case "apiv2":
-        host = u.Scheme + "://" + u.Host
-    }
-    return host
+u, err := url.Parse(Url)
+var host string
+checkErr(err)
+switch ht {
+case "apiv1":
+host = u.Scheme + "://" + u.Host + path.Dir(u.Path)
+case "apiv2":
+host = u.Scheme + "://" + u.Host
+}
+return host
 }
 ```
