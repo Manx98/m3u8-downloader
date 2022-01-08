@@ -31,7 +31,7 @@ import (
 
 const (
 	// HEAD_TIMEOUT 请求头超时时间
-	HEAD_TIMEOUT = 10 * time.Second
+	HEAD_TIMEOUT = 20 * time.Second
 	// PROGRESS_WIDTH 进度条长度
 	PROGRESS_WIDTH = 40
 )
@@ -46,6 +46,7 @@ var (
 	sFlag              = flag.Int("s", 0, "是否允许不安全的请求(默认为0)")
 	spFlag             = flag.String("sp", "", "文件保存路径(默认为当前路径)")
 	ffmpegPath         = flag.String("ffmpeg", "", "ffmpeg命令路径(默认不使用ffmpeg来进行ts文件合并)")
+	highBandWidthFlag  = flag.Bool("highBandWidth", true, "嵌套m3u8情况下下载最高码率的资源(默认true)")
 	ffmpegMergeCmdArgs = "-f concat -safe 0 -i ffmpeg_ts_file_list.txt -y -c copy merge.mp4"
 	enableFFmpeg       = false
 	logger             *log.Logger
@@ -85,12 +86,12 @@ func Run() {
 	flag.Parse()
 	m3u8Url := *urlFlag
 	maxGoroutines := *nFlag
-	hostType := *htFlag
 	downloadFileName := *oFlag
 	cookie := *cFlag
 	insecure := *sFlag
 	savePath := *spFlag
-	ro.Headers["Referer"] = getHost(m3u8Url, "apiv2")
+	m3u8Host := getHost(m3u8Url)
+	ro.Headers["Referer"] = m3u8Host
 	if insecure != 0 {
 		ro.InsecureSkipVerify = true
 	}
@@ -115,50 +116,51 @@ func Run() {
 	}
 	//pwd = "/Users/chao/Desktop" //自定义地址
 	downloadTmpDir := path.Join(pwd, downloadFileName+"_tmp")
-	if isExist, _ := PathExists(downloadTmpDir); !isExist {
-		err := os.MkdirAll(downloadTmpDir, os.ModePerm)
+	isExist, err := PathExists(downloadTmpDir)
+	checkErr(err)
+	if !isExist {
+		err = os.MkdirAll(downloadTmpDir, os.ModePerm)
 		if err != nil {
 			panic(fmt.Errorf("创建目录[%v]出现异常:%v", downloadTmpDir, err))
 		}
 	}
 
-	m3u8Host := getHost(m3u8Url, hostType)
-	m3u8Body := getM3u8Body(m3u8Url)
+	m3u8Body := getM3u8Body(m3u8Url, m3u8Host)
 	//m3u8Body := getFromFile()
 
 	tsKey := getM3u8Key(m3u8Host, m3u8Body)
 	if tsKey != "" {
-		fmt.Printf("待解密 ts 文件 key : %s \n", tsKey)
+		fmt.Printf("[信息]:待解密 ts 文件 key : %s \n", tsKey)
 	}
 
 	tsList := getTsList(m3u8Host, m3u8Body)
 	if enableFFmpeg {
 		writeFFmpegTsFilePathList(downloadTmpDir, tsList)
 	}
-	fmt.Println("待下载 ts 文件数量:", len(tsList))
+	fmt.Println("[信息]:待下载 ts 文件数量:", len(tsList))
 
 	// 下载ts
 	downloader(tsList, maxGoroutines, downloadTmpDir, tsKey)
-	fmt.Println("[合并]:正在开始合并ts文件合并到临时文件merge.mp4")
+	fmt.Println("\n[信息]:正在合并ts文件合并到临时文件merge.mp4")
 	switch runtime.GOOS {
 	case "windows":
 		winMergeFile(downloadTmpDir)
 	default:
 		unixMergeFile(downloadTmpDir)
 	}
-	fmt.Println("[重命名]:将临时文件重命名为正确文件名")
+	fmt.Println("[信息]:将临时文件重命名为正确文件名")
 	finalSavePath := path.Join(pwd, downloadFileName+".mp4")
-	err := os.Rename(path.Join(downloadTmpDir, "merge.mp4"), finalSavePath)
+	err = os.Rename(path.Join(downloadTmpDir, "merge.mp4"), finalSavePath)
 	if err != nil {
 		panic(fmt.Errorf("重命名合并文件时出现异常:%v", err))
 	}
 	Chdir(pwd)
-	fmt.Println("[清理]开始移除临时缓存目录")
+	fmt.Println("[信息]:开始移除临时缓存目录")
 	err = os.RemoveAll(downloadTmpDir)
 	if err != nil {
 		panic(fmt.Errorf("删除临时目录[%v]时出现错误:%v", downloadTmpDir, err))
 	}
-	fmt.Printf("[Success] 下载保存路径：%s | 共耗时: %6.2fs\n", finalSavePath, time.Now().Sub(now).Seconds())
+	fmt.Printf("[结束]:下载保存路径：%s | 共耗时: %6.2fs\n", finalSavePath, time.Now().Sub(now).Seconds())
 }
 
 // writeFFmpegTsFilePathList 将ts文件列表写入到指定目录下的ffmpeg_ts_file_list.txt文件中
@@ -189,12 +191,16 @@ func writeFFmpegTsFilePathList(downloadTmpDir string, tsList []TsInfo) {
 }
 
 // 获取m3u8地址的host
-func getHost(Url, ht string) (host string) {
+func getHost(Url string) (host string) {
 	u, err := url.Parse(Url)
 	checkErr(err)
-	switch ht {
+	switch *htFlag {
 	case "apiv1":
-		host = u.Scheme + "://" + u.Host + path.Dir(u.RawPath)
+		parent := path.Dir(u.RawPath)
+		if !strings.HasPrefix(parent, "/") {
+			parent = ""
+		}
+		host = u.Scheme + "://" + u.Host + parent
 	case "apiv2":
 		host = u.Scheme + "://" + u.Host
 	}
@@ -202,10 +208,86 @@ func getHost(Url, ht string) (host string) {
 }
 
 // 获取m3u8地址的内容体
-func getM3u8Body(Url string) string {
-	r, err := grequests.Get(Url, ro)
-	checkErr(err)
-	return r.String()
+// 添加支持嵌套文件解析
+func getM3u8Body(Url, host string) string {
+	host = strings.TrimSuffix(host, "/")
+	var m3u8Text string
+	for {
+		r, err := grequests.Get(Url, ro)
+		checkErr(err)
+		m3u8Text = r.String()
+		x, bandWidth := findBeastDownloadResolution(m3u8Text, host)
+		if x == "" {
+			return m3u8Text
+		} else {
+			fmt.Printf("发现多资源链接:url:%v,码率:%v\n", x, bandWidth)
+			Url = x
+		}
+	}
+}
+
+//判断link是否为完整http链接，否则使用提供的host与子拼接
+func buildM3u8ResourceUrl(link, host string) string {
+	if strings.HasPrefix(link, "http") {
+		return link
+	} else {
+		if strings.HasPrefix(link, "/") {
+			return host + link
+		} else {
+			return host + "/" + link
+		}
+	}
+}
+
+//检查并判断是否含有多资源
+//从m3u8文件中查符合策略的资源链接
+func findBeastDownloadResolution(m3u8Text, host string) (string, int) {
+	var bastLink string
+	markResource := false
+	bandWidth := -1
+	for _, line := range strings.Split(m3u8Text, "\n") {
+		if line == "" {
+			continue
+		}
+		if markResource {
+			bastLink = buildM3u8ResourceUrl(line, host)
+			markResource = false
+		} else {
+			x, f := getBandWidth(line)
+			if f {
+				replaceOld := true
+				if bastLink != "" {
+					if *highBandWidthFlag {
+						replaceOld = x > bandWidth
+					} else {
+						replaceOld = x < bandWidth
+					}
+				}
+				if replaceOld {
+					bandWidth = x
+					markResource = true
+				}
+			}
+		}
+	}
+	return bastLink, bandWidth
+}
+
+//获取资源码率
+//返回[资源码率(默认0), 是否找到资源码率]
+func getBandWidth(line string) (int, bool) {
+	if strings.HasPrefix(line, "#EXT-X-STREAM-INF") {
+		line = strings.TrimPrefix(line, "#EXT-X-STREAM-INF:")
+		for _, param := range strings.Split(line, ",") {
+			split := strings.Split(param, "=")
+			if len(split) == 2 && split[0] == "BANDWIDTH" {
+				x, err := strconv.Atoi(split[1])
+				checkErr(err)
+				return x, true
+			}
+		}
+	}
+	return 0, false
 }
 
 // 获取m3u8加密的密钥
@@ -224,6 +306,8 @@ func getM3u8Key(host, html string) (key string) {
 			checkErr(err)
 			if res.StatusCode == 200 {
 				key = res.String()
+			} else {
+				panic(fmt.Errorf("无法下载密匙,错误状态码:%v", res.StatusCode))
 			}
 		}
 	}
@@ -237,7 +321,6 @@ func getTsList(host, body string) (tsList []TsInfo) {
 
 	for _, line := range lines {
 		if !strings.HasPrefix(line, "#") && line != "" {
-			//有可能出现的二级嵌套格式的m3u8,请自行转换！
 			index++
 			if strings.HasPrefix(line, "http") {
 				ts = TsInfo{
@@ -284,11 +367,12 @@ func downloadTsFile(ts TsInfo, downloadDir, key string, retries int) {
 		}
 	}()
 
-	currPath := fmt.Sprintf("%s/%s", downloadDir, ts.Name)
-	if isExist, _ := PathExists(currPath); isExist {
-		//logger.Println("[warn] File: " + ts.Name + "already exist")
-		return
-	}
+	currPath := path.Join(downloadDir, ts.Name)
+	//在没有校验的情况下此操作无法保证资源完整性
+	//if isExist, _ := PathExists(currPath); isExist {
+	//	//logger.Println("[warn] File: " + ts.Name + "already exist")
+	//	return
+	//}
 	res, err := grequests.Get(ts.Url, ro)
 	if err != nil || !res.Ok {
 		if retries > 0 {
@@ -351,14 +435,14 @@ func downloader(tsList []TsInfo, maxGoroutines int, downloadDir string, key stri
 	for _, ts := range tsList {
 		wg.Add(1)
 		limiter <- struct{}{}
-		go func(ts TsInfo, downloadDir, key string, retryies int) {
+		go func(ts TsInfo, downloadDir, key string, retries int) {
 			defer func() {
 				wg.Done()
 				<-limiter
 			}()
-			downloadTsFile(ts, downloadDir, key, retryies)
+			downloadTsFile(ts, downloadDir, key, retries)
 			downloadCount++
-			DrawProgressBar("Downloading", float32(downloadCount)/float32(tsLen), PROGRESS_WIDTH, ts.Name)
+			DrawProgressBar("下载", float32(downloadCount)/float32(tsLen), PROGRESS_WIDTH, ts.Name)
 			return
 		}(ts, downloadDir, key, retry)
 	}
@@ -500,7 +584,7 @@ func Rename(oldPath, newPath string) {
 func unixMergeFile(path string) {
 	Chdir(path)
 	if enableFFmpeg {
-		ExecWinShell(*ffmpegPath + " " + ffmpegMergeCmdArgs)
+		ExecUnixShell(*ffmpegPath + " " + ffmpegMergeCmdArgs)
 	} else {
 		ExecUnixShell(`cat *.ts >> merge.mp4`)
 	}
