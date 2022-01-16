@@ -31,14 +31,18 @@ func fileDownloadHandler(Url, savePath string, key []byte) (int, error) {
 	if !res.Ok {
 		return contentLen, fmt.Errorf("请求失败: %v", Url)
 	}
-	// 校验长度是否合法
 	origData := res.Bytes()
-	contentLen, err = strconv.Atoi(res.Header.Get("Content-Length"))
-	if err != nil {
-		return contentLen, err
-	}
-	if len(origData) == 0 || (contentLen > 0 && len(origData) < contentLen) || res.Error != nil {
-		return contentLen, fmt.Errorf("Content-Length:%v, 但是接收到了:%v", contentLen, len(origData))
+	// 校验长度是否合法
+	if *enableDataLengthChecking {
+		contentLen, err = strconv.Atoi(res.Header.Get("Content-Length"))
+		if err != nil {
+			return contentLen, err
+		}
+		if len(origData) == 0 || (contentLen > 0 && len(origData) < contentLen) || res.Error != nil {
+			return contentLen, fmt.Errorf("数据长度不合法,Content-Length=%v, 接收到=%v", contentLen, len(origData))
+		}
+	} else {
+		contentLen = len(origData)
 	}
 
 	// 解密出视频 ts 源文件
@@ -78,7 +82,7 @@ func downloadTsFile(ts TsInfo, downloadDir string, key []byte, retries int) int 
 			if retries == 0 {
 				panic(fmt.Errorf("超过重试最大次数:%v", err))
 			} else {
-				fmt.Printf("分片[%v]下载出现异常,即将重试:%v\n", ts.Name, err)
+				fmt.Printf("\n[警告]分片[%v]下载出现异常,即将重试:%v\n", ts.Name, err)
 			}
 			retries -= 1
 		} else {

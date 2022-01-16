@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"runtime"
-	"strings"
 	"time"
 )
 
@@ -14,7 +13,6 @@ var (
 	// 命令行参数
 	M3u8UrlFlag              = flag.String("u", "", "m3u8下载地址(http(s)://url/xx/xx/index.m3u8)")
 	maxWorkersFlag           = flag.Int("n", 16, "下载线程数(max goroutines num)")
-	hostTypeFlag             = flag.String("ht", "apiv1", "设置getHost的方式(apiv1: `http(s):// + url.Host + path.Dir(url.Path)`; apiv2: `http(s)://+ u.Host`")
 	DownloadFileName         = flag.String("o", "output", "自定义文件名(默认为output)")
 	cookieFlag               = flag.String("c", "", "自定义请求cookie")
 	safetyFlag               = flag.Bool("s", false, "是否允许不安全的请求,默认为false")
@@ -22,6 +20,8 @@ var (
 	ffmpegPath               = flag.String("ff", "", "ffmpeg命令路径(默认不使用ffmpeg来进行ts文件合并)")
 	highBandWidthFlag        = flag.Bool("hbw", true, "嵌套m3u8下载最高码率的资源,默认true")
 	retryTimes               = flag.Int("rt", 5, "单个分片下载最大重试次数,默认5次")
+	refererFlag              = flag.String("rf", "", "设置请求头Referer")
+	enableDataLengthChecking = flag.Bool("dlc", true, "是否检验下载分片长度校验是否合法(默认true),关闭可能导致数据不完整")
 	FFmpegTsFileListFileName = "ffmpeg_ts_file_list.txt"
 	MergeFileName            = "merge.mp4"
 	logger                   = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile)
@@ -52,9 +52,10 @@ func InitConfigFromFlag() {
 	if *ffmpegPath != "" {
 		ffmpegCheck(ffmpegPath)
 	}
-	if !strings.HasPrefix(*M3u8UrlFlag, "http") || !strings.Contains(*M3u8UrlFlag, "m3u8") || *M3u8UrlFlag == "" {
-		flag.Usage()
-		return
+	if *refererFlag == "" {
+		requestOptions.Headers["Referer"] = getHost(*M3u8UrlFlag)
+	} else {
+		requestOptions.Headers["Referer"] = *refererFlag
 	}
 	requestOptions.InsecureSkipVerify = *safetyFlag
 }

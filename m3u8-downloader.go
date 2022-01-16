@@ -17,7 +17,7 @@ func main() {
 }
 
 func Run() {
-	msgTpl := "[功能]:多线程下载直播流 m3u8 视屏（ts + 合并）\n[提醒]:如果下载失败，请使用 -ht=apiv2 \n[提醒]:如果下载失败，m3u8 地址可能存在嵌套\n[提醒]:如果进度条中途下载失败，可重复执行"
+	msgTpl := "[功能]:多线程下载直播流 m3u8 视屏（ts + 合并）\n[提醒]:如果频繁提示[数据长度不合法]尝试可以使用-dlc=false关闭校验,但是可能导致数据不完整\n[提醒]:如果进度条中途下载失败，可重复执行"
 	fmt.Println(msgTpl)
 	now := time.Now()
 	pwd := util.GetWorkDir()
@@ -32,7 +32,7 @@ func Run() {
 			panic(fmt.Errorf("创建目录[%v]出现异常:%v", downloadTmpDir, err))
 		}
 	}
-	m3u8Info := util.DecodeM3u8FileByUrl(*util.M3u8UrlFlag)
+	m3u8Info := util.DecodeM3u8FileByUrl(util.M3u8UrlFlag)
 	if len(m3u8Info.TsList) > 0 {
 		fmt.Println("[信息]:待下载 ts 文件数量:", len(m3u8Info.TsList))
 		// 下载ts

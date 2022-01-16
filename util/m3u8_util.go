@@ -20,9 +20,12 @@ type TsInfo struct {
 
 // M3U8FileInfo 用于存储解码后的m3u8文件信息
 type M3U8FileInfo struct {
-	TsList  []TsInfo
-	Key     string
-	KeyType int
+	TsList    []TsInfo
+	Key       string
+	KeyType   int
+	ParentUrl *string
+	Host      *string
+	Mode      int
 }
 
 // writeFFmpegTsFilePathList 将ts文件列表写入到指定目录下的ffmpeg_ts_file_list.txt文件中
@@ -56,54 +59,71 @@ func writeFFmpegTsFilePathList(downloadTmpDir string, tsList []TsInfo) {
 func getHost(Url string) (host string) {
 	u, err := url.Parse(Url)
 	CheckErr(err)
-	switch *hostTypeFlag {
-	case "apiv1":
-		parent := path.Dir(u.RawPath)
-		if !strings.HasPrefix(parent, "/") {
-			parent = ""
-		}
-		host = u.Scheme + "://" + u.Host + parent
-	case "apiv2":
-		host = u.Scheme + "://" + u.Host
+	return u.Scheme + "://" + u.Host
+}
+
+// 获取Host以及父级Url
+func getHostAndParentUrl(Url *url.URL) (string, string) {
+	h := Url.Scheme + "://" + Url.Host
+	parent := path.Dir(Url.Path)
+	if parent == "." || parent == "/" || parent == "" {
+		return h, h
+	} else if strings.HasPrefix(parent, "/") {
+		return h, h + parent
+	} else {
+		return h, h + "/" + parent
 	}
-	return
+}
+
+// 修复存在重定向URL
+func fixM3U8UrlRedirect(response *grequests.Response, parentUrl, host *string) {
+	rsp := response.RawResponse.Request.Response
+	if rsp != nil && rsp.StatusCode == 302 {
+		u, e := url.Parse(rsp.Header.Get("Location"))
+		CheckErr(e)
+		*host, *parentUrl = getHostAndParentUrl(u)
+	} else {
+		_, *parentUrl = getHostAndParentUrl(response.RawResponse.Request.URL)
+	}
 }
 
 // 获取m3u8地址的内容体
 // 添加支持嵌套文件解析
-func getM3u8Body(Url, host string) string {
+func getM3u8Body(Url, host *string) string {
 	fmt.Println("[信息]:正在下载M3U8文件内容")
-	host = strings.TrimSuffix(host, "/")
 	var m3u8Text string
+	requestUrl := *Url
 	for {
-		r, err := grequests.Get(Url, requestOptions)
+		r, err := grequests.Get(requestUrl, requestOptions)
 		CheckErr(err)
+		fixM3U8UrlRedirect(r, Url, host)
 		m3u8Text = r.String()
-		x := findBeastDownloadResolution(m3u8Text, host)
+		x := findBeastDownloadResolution(m3u8Text, *Url, *host)
 		if x == "" {
 			return m3u8Text
 		} else {
-			Url = x
+			requestUrl = x
 		}
 	}
 }
 
 //判断link是否为完整http链接，否则使用提供的host与子拼接
-func buildM3u8ResourceUrl(link, host string) string {
+//ParentUrl 与 host 均为末尾无"/"
+func buildM3u8ResourceUrl(link, parentUrl, host string) string {
 	if strings.HasPrefix(link, "http") {
 		return link
 	} else {
 		if strings.HasPrefix(link, "/") {
 			return host + link
 		} else {
-			return host + "/" + link
+			return parentUrl + "/" + link
 		}
 	}
 }
 
 //检查并判断是否含有多资源
 //从m3u8文件中查符合策略的资源链接
-func findBeastDownloadResolution(m3u8Text, host string) string {
+func findBeastDownloadResolution(m3u8Text, Url, host string) string {
 	var bastLink string
 	markResource := false
 	bandWidth := -1
@@ -112,7 +132,7 @@ func findBeastDownloadResolution(m3u8Text, host string) string {
 			continue
 		}
 		if markResource {
-			bastLink = buildM3u8ResourceUrl(line, host)
+			bastLink = buildM3u8ResourceUrl(line, Url, host)
 			markResource = false
 		} else {
 			x, f := getBandWidth(line)
@@ -153,7 +173,7 @@ func getBandWidth(line string) (int, bool) {
 }
 
 //获取m3u8加密的密钥
-func getM3u8Key(host, m3u8Text string) string {
+func getM3u8Key(host, parentUrl, m3u8Text string) string {
 	fmt.Println("[信息]:正在查找M3U8密匙")
 	lines := strings.Split(m3u8Text, "\n")
 	for _, line := range lines {
@@ -161,8 +181,12 @@ func getM3u8Key(host, m3u8Text string) string {
 			uriPos := strings.Index(line, "URI")
 			quotationMarkPos := strings.LastIndex(line, "\"")
 			keyUrl := strings.Split(line[uriPos:quotationMarkPos], "\"")[1]
-			if !strings.Contains(line, "http") {
-				keyUrl = fmt.Sprintf("%s/%s", host, keyUrl)
+			if !strings.HasPrefix(keyUrl, "http") {
+				if strings.HasPrefix(keyUrl, "/") {
+					keyUrl = parentUrl + "/" + keyUrl
+				} else {
+					keyUrl = fmt.Sprintf("%s/%s", host, keyUrl)
+				}
 			}
 			fmt.Println("[信息]:正在下载解密 ts 文件 Key")
 			res, err := grequests.Get(keyUrl, requestOptions)
@@ -181,29 +205,26 @@ func getM3u8Key(host, m3u8Text string) string {
 }
 
 //获取Ts文件列表信息
-func getTsList(host, m3u8Text string) (tsList []TsInfo) {
-	lines := strings.Split(m3u8Text, "\n")
+func getTsList(host, parentUrl, m3u8Text string) (tsList []TsInfo) {
 	index := 0
-	var ts TsInfo
 	fundInf := false
-	for _, line := range lines {
+	for _, line := range strings.Split(m3u8Text, "\n") {
 		if fundInf == false && strings.HasPrefix(line, "#EXTINF") {
 			fundInf = true
 		} else if fundInf && line != "" {
 			index++
-			if strings.HasPrefix(line, "http") {
-				ts = TsInfo{
-					Name: fmt.Sprintf("%05d.ts", index),
-					Url:  line,
+			Url := line
+			if !strings.HasPrefix(line, "http") {
+				if strings.HasPrefix(line, "/") {
+					Url = host + line
+				} else {
+					Url = parentUrl + "/" + line
 				}
-				tsList = append(tsList, ts)
-			} else {
-				ts = TsInfo{
-					Name: fmt.Sprintf("%05d.ts", index),
-					Url:  fmt.Sprintf("%s/%s", host, line),
-				}
-				tsList = append(tsList, ts)
 			}
+			tsList = append(tsList, TsInfo{
+				Name: fmt.Sprintf("%05d.ts", index),
+				Url:  Url,
+			})
 			fundInf = false
 		}
 	}
@@ -212,25 +233,21 @@ func getTsList(host, m3u8Text string) (tsList []TsInfo) {
 
 // CheckM3u8Link 检查m3u8链接
 func CheckM3u8Link(link *string) {
-	if !strings.HasPrefix(*link, "http") || !strings.Contains(*link, "m3u8") || *M3u8UrlFlag == "" {
+	if !strings.HasPrefix(*link, "http") {
 		flag.Usage()
 		panic(fmt.Errorf("无效M3U8链接:%v", *link))
 	}
 }
 
-// DecodeM3u8FileByContent 从字符串解析m3u8文件
-func DecodeM3u8FileByContent(host, m3u8Text string) M3U8FileInfo {
-	m3u8FileInfo := M3U8FileInfo{
-		Key:     getM3u8Key(host, m3u8Text),
-		TsList:  getTsList(host, m3u8Text),
-		KeyType: 0,
-	}
-	m3u8FileInfo.KeyType = 0
-	return m3u8FileInfo
-}
-
 // DecodeM3u8FileByUrl 从文件Url解析m3u8文件
-func DecodeM3u8FileByUrl(url string) M3U8FileInfo {
-	host := getHost(url)
-	return DecodeM3u8FileByContent(host, getM3u8Body(url, host))
+func DecodeM3u8FileByUrl(Url *string) M3U8FileInfo {
+	m3u8FileInfo := M3U8FileInfo{
+		ParentUrl: Url,
+		Host:      refererFlag,
+	}
+	m3u8Text := getM3u8Body(m3u8FileInfo.ParentUrl, m3u8FileInfo.Host)
+	m3u8FileInfo.TsList = getTsList(*m3u8FileInfo.Host, *m3u8FileInfo.ParentUrl, m3u8Text)
+	m3u8FileInfo.KeyType = 0
+	m3u8FileInfo.Key = getM3u8Key(*m3u8FileInfo.Host, *m3u8FileInfo.ParentUrl, m3u8Text)
+	return m3u8FileInfo
 }
