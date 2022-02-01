@@ -53,9 +53,8 @@ func InitConfigFromFlag() {
 		ffmpegCheck(ffmpegPath)
 	}
 	if *refererFlag == "" {
-		requestOptions.Headers["Referer"] = getHost(*M3u8UrlFlag)
-	} else {
-		requestOptions.Headers["Referer"] = *refererFlag
+		*refererFlag = getHost(*M3u8UrlFlag)
 	}
+	requestOptions.Headers["Referer"] = *refererFlag
 	requestOptions.InsecureSkipVerify = *safetyFlag
 }
